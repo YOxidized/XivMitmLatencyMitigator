@@ -8,23 +8,17 @@ import ipaddress
 import math
 import os
 import random
-import select
-import signal
 import socket
 import struct
+import threading
 import time
 import typing
 import zlib
-
-import json
-
-import requests
 
 ACTION_ID_AUTO_ATTACK = 0x0007
 ACTION_ID_AUTO_ATTACK_MCH = 0x0008
 AUTO_ATTACK_DELAY = 0.1
 SO_ORIGINAL_DST = 80
-OPCODE_DEFINITION_LIST_URL = "https://api.github.com/repos/Soreepeong/XivAlexander/contents/StaticData/OpcodeDefinition"
 
 # Server responses have been usually taking between 50ms and 100ms on below-1ms
 # latency to server, so 75ms is a good average.
@@ -32,14 +26,18 @@ OPCODE_DEFINITION_LIST_URL = "https://api.github.com/repos/Soreepeong/XivAlexand
 # and it's very easy to identify whether you're trying to go below allowed minimum value.
 # This addon is already in gray area. Do NOT decrease this value. You've been warned.
 # Feel free to increase and see how does it feel like to play on high latency instead, though.
-DEFAULT_EXTRA_DELAY = 0.075
-MAXIMUM_EXTRA_DELAY = 0.150
+EXTRA_DELAY = 0.075
 
-T = typing.TypeVar("T")
+# Based on assumption that all game servers of a datacenter should exist in /24 subnet
+INTL_DATACENTER_IP_NETWORK = [socket.gethostbyname(f"neolobby{i:>02}.ffxiv.com") for i in range(1, 9)]
+INTL_DATACENTER_IP_NETWORK = set(ipaddress.ip_network(".".join(x.split(".")[0:3]) + ".0/24")
+                                 for x in INTL_DATACENTER_IP_NETWORK)
 
+KR_DATACENTER_IP_NETWORK = [socket.gethostbyname("lobbyf-live.ff14.co.kr")]
+KR_DATACENTER_IP_NETWORK = set(ipaddress.ip_network(".".join(x.split(".")[0:3]) + ".0/24")
+                               for x in KR_DATACENTER_IP_NETWORK)
 
-def clamp(v: T, min_: T, max_: T) -> T:
-    return max(min_, min(max_, v))
+multithread_print_lock = threading.Lock()
 
 
 class TcpInfo(ctypes.Structure):
@@ -111,7 +109,7 @@ class TcpInfo(ctypes.Structure):
         return "{}({})".format(self.__class__.__name__, fields)
 
     @classmethod
-    def from_socket(cls, sock: socket.socket):
+    def from_socket(cls, sock):
         """Takes a socket, and attempts to get TCP_INFO stats on it. Returns a
         TcpInfo struct"""
         # http://linuxgazette.net/136/pfeiffer.html
@@ -120,14 +118,6 @@ class TcpInfo(ctypes.Structure):
         # On older kernels, we get fewer bytes, pad with null to fit
         padded = data.ljust(padsize, b'\0')
         return cls.from_buffer_copy(padded)
-
-    @classmethod
-    def get_latency(cls, sock: socket.socket) -> typing.Optional[float]:
-        info = cls.from_socket(sock)
-        if info.tcpi_rtt:
-            return info.tcpi_rtt / 1000000
-        else:
-            return None
 
 
 class IncompleteDataException(ValueError):
@@ -369,7 +359,7 @@ class XivBundle(StructBase, definition="<16sQH2sHHBB6s"):
         return res
 
     @classmethod
-    def find(cls, data: typing.Union[bytes, bytearray]):
+    def find(cls, data: bytes):
         offset = 0
         while offset < len(data):
             available_bytes = len(data) - offset
@@ -387,14 +377,13 @@ class XivBundle(StructBase, definition="<16sQH2sHHBB6s"):
                 i = min(mc1, mc2)
             if i == -1:  # no hope
                 yield data[offset:]
-                offset = len(data)
                 break
             if i != offset:
                 yield data[offset:i]
                 offset = i
 
             if len(data) < offset + cls.DEFINITION.size:
-                break
+                return data[offset:]
 
             try:
                 bundle = XivBundle(data, offset)
@@ -402,93 +391,11 @@ class XivBundle(StructBase, definition="<16sQH2sHHBB6s"):
                 # bundle.length might be modified from this point
                 yield bundle
             except IncompleteDataException:
-                break
+                return data[offset:]
             except InvalidDataException:
                 yield data[offset:offset + 1]
                 offset += 1
-        return offset
-
-
-@dataclasses.dataclass
-class OpcodeDefinition:
-    Name: str
-    C2S_ActionRequest: int
-    C2S_ActionRequestGroundTargeted: int
-    S2C_ActionEffect01: int
-    S2C_ActionEffect08: int
-    S2C_ActionEffect16: int
-    S2C_ActionEffect24: int
-    S2C_ActionEffect32: int
-    S2C_ActorCast: int
-    S2C_ActorControl: int
-    S2C_ActorControlSelf: int
-    S2C_AddStatusEffect: int
-    Server_IpRange: typing.List[typing.Union[ipaddress.IPv4Network,
-                                             typing.Tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]]]
-    Server_PortRange: typing.List[typing.Tuple[int, int]]
-
-    @classmethod
-    def from_dict(cls, data: dict):
-        kwargs = {}
-        for field in dataclasses.fields(cls):
-            field: dataclasses.Field
-            if field.type is int:
-                kwargs[field.name] = int(data[field.name], 0)
-            elif field.name == "Server_IpRange":
-                iplist = []
-                for partstr in data[field.name].split(","):
-                    part = [x.strip() for x in partstr.split("-")]
-                    try:
-                        if len(part) == 1:
-                            iplist.append(ipaddress.IPv4Network(part[0]))
-                        elif len(part) == 2:
-                            iplist.append(tuple(sorted(ipaddress.IPv4Address(x) for x in part)))
-                        else:
-                            raise ValueError
-                    except ValueError:
-                        print("Skipping invalid IP address definition", partstr)
-                kwargs[field.name] = iplist
-            elif field.name == "Server_PortRange":
-                portlist = []
-                for partstr in data[field.name].split(","):
-                    part = [x.strip() for x in partstr.split("-")]
-                    try:
-                        if len(part) == 1:
-                            portlist.append((int(part[0], 0), int(part[0], 0)))
-                        elif len(part) == 2:
-                            portlist.append((int(part[0], 0), int(part[1], 0)))
-                        else:
-                            raise ValueError
-                    except ValueError:
-                        print("Skipping invalid port definition", partstr)
-                kwargs[field.name] = portlist
-            else:
-                kwargs[field.name] = None if data[field.name] is None else field.type(data[field.name])
-        return OpcodeDefinition(**kwargs)
-
-    def is_request(self, opcode: int):
-        return (opcode == self.C2S_ActionRequest
-                or opcode == self.C2S_ActionRequestGroundTargeted)
-
-    def is_action_effect(self, opcode: int):
-        return (opcode == self.S2C_ActionEffect01
-                or opcode == self.S2C_ActionEffect08
-                or opcode == self.S2C_ActionEffect16
-                or opcode == self.S2C_ActionEffect24
-                or opcode == self.S2C_ActionEffect32)
-
-
-definitions: typing.List[OpcodeDefinition] = []
-
-
-@dataclasses.dataclass
-class SocketSet:
-    source: socket.socket
-    target: socket.socket
-    log_prefix: str
-    process_function: callable
-    incoming: typing.Optional[bytearray] = dataclasses.field(default_factory=bytearray)
-    outgoing: typing.Optional[bytearray] = dataclasses.field(default_factory=bytearray)
+        return b""
 
 
 @dataclasses.dataclass
@@ -501,105 +408,98 @@ class PendingAction:
     is_cast: bool = False
 
 
-class NumericStatisticsTracker:
-    def __init__(self, count: int, max_age: typing.Optional[float] = None):
-        self._count = count
-        self._max_age = max_age
-        self._values = collections.deque()
-        self._expiry = collections.deque()
-
-    def add(self, v: float):
-        self._values.append(v)
-        if self._max_age is not None:
-            self._expiry.append(time.time() + self._max_age)
-        while len(self._values) > self._count:
-            self._values.popleft()
-            if self._max_age is not None:
-                self._expiry.popleft()
-
-    def min(self) -> typing.Optional[float]:
-        return min(self._values) if self._values else None
-
-    def max(self) -> typing.Optional[float]:
-        return max(self._values) if self._values else None
-
-    def mean(self) -> typing.Optional[float]:
-        return sum(self._values) / len(self._values) if self._values else None
-
-    def median(self) -> typing.Optional[float]:
-        if not self._values:
-            return None
-        s = list(sorted(self._values))
-        if len(s) % 2 == 0:
-            return (s[len(s) // 2] + s[len(s) // 2 - 1]) / 2
-        else:
-            return s[len(s) // 2]
-
-    def deviation(self) -> typing.Optional[float]:
-        if not self._values:
-            return None
-        mean = self.mean()
-        return math.sqrt(sum(pow(x - mean, 2) for x in self._values) / len(self._values))
-
-    def __bool__(self):
-        return not not self._values
-
-
 class Connection:
+    all_connections: typing.ClassVar["Connection"] = list()
     pending_actions: typing.Deque[PendingAction] = collections.deque()
     log_fp: typing.Optional[typing.TextIO] = None
-    opcodes: typing.Optional[OpcodeDefinition]
 
     def __init__(self, sock: socket.socket, source: typing.Tuple[str, int]):
         self.source = source
-        self.downstream = sock
-        self.downstream.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-        self.downstream.setsockopt(socket.SOL_TCP, socket.TCP_QUICKACK, 1)
-        self.downstream.setblocking(False)
+        self.socket = sock
+        self.socket.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+        self.socket.setsockopt(socket.SOL_TCP, socket.TCP_QUICKACK, 1)
 
-        self.screen_prefix = f"[{os.getpid():>6}]"
-        srv_port, srv_ip = struct.unpack("!2xH4s8x", self.downstream.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16))
+        self.conn_id = self.socket.fileno()
+        srv_port, srv_ip = struct.unpack("!2xH4s8x", self.socket.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16))
         self.destination = (socket.inet_ntoa(srv_ip), srv_port)
-        self.upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.upstream.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-        self.upstream.setsockopt(socket.SOL_TCP, socket.TCP_QUICKACK, 1)
-        self.upstream.setblocking(False)
+        self.remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.remote.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+        self.remote.setsockopt(socket.SOL_TCP, socket.TCP_QUICKACK, 1)
+
+        self.broken_event = threading.Event()
 
         self.last_animation_lock_ends_at = 0
         self.last_successful_request = PendingAction(0, 0)
 
-        self.latency_application = NumericStatisticsTracker(10)
-        self.latency_upstream = NumericStatisticsTracker(10)
-        self.latency_downstream = NumericStatisticsTracker(10)
-        self.latency_exaggeration = NumericStatisticsTracker(10, 30.)
+        self.is_game_connection = True
 
-        dest_ip = ipaddress.IPv4Address(self.destination[0])
-        for definition in definitions:
-            for iprange in definition.Server_IpRange:
-                if isinstance(iprange, ipaddress.IPv4Network):
-                    if dest_ip in iprange:
-                        break
-                else:
-                    if iprange[0] <= dest_ip <= iprange[1]:
-                        break
-            else:
-                continue
+        # See: https://github.com/ravahn/machina/tree/NetworkStructs/Machina.FFXIV/Headers/Opcodes
+        if any(ipaddress.ip_address(self.destination[0]) in x for x in INTL_DATACENTER_IP_NETWORK):
+            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x02cc
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x0164
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x0356
+            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x008f, 0x0247, 0x02c1, 0x0295, 0x034c]
 
-            for port1, port2 in definition.Server_PortRange:
-                if port1 <= self.destination[1] <= port2:
-                    break
-            else:
-                continue
+            self.SUBTYPE_REQUEST_ACTION = [0x03a0, 0x036b]
 
-            self.log(f"New[{definition.Name}]", self.downstream.getsockname(), self.downstream.getpeername(),
-                     self.destination)
-            self.opcodes = definition
-            break
+            self.log(f"New[INTL]:", self.socket.getsockname(), self.socket.getpeername(), self.destination)
+
+        elif any(ipaddress.ip_address(self.destination[0]) in x for x in KR_DATACENTER_IP_NETWORK):
+            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x012c
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x017a
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x007c
+            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x02d0, 0x0199, 0x02d1, 0x01a4, 0x016e]
+
+            self.SUBTYPE_REQUEST_ACTION = [0x02b3, 0x0250]
+
+            self.log(f"New[KR]:", self.socket.getsockname(), self.socket.getpeername(), self.destination)
         else:
-            self.opcodes = None
-            self.log(f"New[-]:", self.downstream.getsockname(), self.downstream.getpeername(), self.destination)
+            self.is_game_connection = False
+            self.log(f"New[-]:", self.socket.getsockname(), self.socket.getpeername(), self.destination)
 
-    def to_upstream(self, bundle: XivBundle):
+    def relay(self, read_fn, write_fn, process_fn: typing.Callable[[XivBundle], XivBundle], log_prefix: str):
+        try:
+            buffer = b""
+            more = True
+            while more:
+                try:
+                    data = read_fn(65536)
+                except (ConnectionError, socket.timeout, OSError):
+                    break
+                buffer += data
+                if not data:
+                    more = False
+                if self.is_game_connection:
+                    it = XivBundle.find(buffer)
+                    while True:
+                        try:
+                            bundle = next(it)
+                        except StopIteration as e:
+                            buffer = e.value
+                            break
+
+                        if type(bundle) is bytes:
+                            self.log(log_prefix, "discarded", " ".join(f"{x:02x}" for x in bundle))
+                            data = bundle
+                        else:
+                            bundle = process_fn(bundle)
+                            data = bytes(bundle)
+                        try:
+                            write_fn(data)
+                        except (ConnectionError, socket.timeout, OSError):
+                            break
+                else:
+                    write_fn(buffer)
+                    buffer = ""
+            if buffer:
+                try:
+                    write_fn(buffer)
+                except (ConnectionError, socket.timeout, OSError):
+                    pass
+        finally:
+            self.broken_event.set()
+
+    def source_to_destination(self, bundle: XivBundle):
         for message in bundle.messages:
             if not message.segment_type == XivMessage.SEGMENT_TYPE_IPC:
                 continue
@@ -607,7 +507,7 @@ class Connection:
                 ipc = XivMessageIpc(message.data, 0)
                 if ipc.type != XivMessageIpc.TYPE_INTERESTED:
                     continue
-                if self.opcodes.is_request(ipc.subtype):
+                if ipc.subtype in self.SUBTYPE_REQUEST_ACTION:
                     request = XivMessageIpcActionRequest(ipc.data, 0)
                     self.pending_actions.append(PendingAction(request.action_id, request.sequence))
 
@@ -625,7 +525,7 @@ class Connection:
                 continue
         return bundle
 
-    def to_downstream(self, bundle: XivBundle):
+    def destination_to_source(self, bundle: XivBundle):
         message_insertions: typing.List[typing.Tuple[int, XivMessage]] = []
         wait_time_dict: typing.Dict[int, float] = {}
         for i, message in enumerate(bundle.messages):
@@ -641,7 +541,7 @@ class Connection:
                     wait_time_dict[data.source_sequence] = data.original_wait_time
                 if ipc.type != XivMessageIpc.TYPE_INTERESTED:
                     continue
-                if self.opcodes.is_action_effect(ipc.subtype):
+                if ipc.subtype in self.SUBTYPE_RESPONSE_ACTION_RESULT:
                     effect = XivMessageIpcActionEffect(ipc.data, 0)
                     original_wait_time = wait_time_dict.get(effect.source_sequence, effect.animation_lock_duration)
                     wait_time = original_wait_time
@@ -664,8 +564,6 @@ class Connection:
                                                                    now + AUTO_ATTACK_DELAY)
                             wait_time = self.last_animation_lock_ends_at - now
 
-                        extra_message += " serverOriginated"
-
                     else:
                         while self.pending_actions and self.pending_actions[0].sequence != effect.source_sequence:
                             item = self.pending_actions.popleft()
@@ -674,30 +572,42 @@ class Connection:
 
                         if self.pending_actions:
                             self.last_successful_request = self.pending_actions.popleft()
-                            self.last_successful_request.response_timestamp = now
-                            self.last_successful_request.original_wait_time = original_wait_time
                             # 100ms animation lock after cast ends stays.
                             # Modify animation lock duration for instant actions only.
                             # Since no other action is in progress right before the cast ends,
                             # we can safely replace the animation lock with the latest after-cast lock.
                             if not self.last_successful_request.is_cast:
-                                rtt = (self.last_successful_request.response_timestamp
-                                       - self.last_successful_request.request_timestamp)
-                                self.latency_application.add(rtt)
-                                extra_message += f" rtt={rtt * 1000:.0f}ms"
-                                delay, message_append = self.resolve_adjusted_extra_delay(rtt)
-                                extra_message += message_append
-                                self.last_animation_lock_ends_at += original_wait_time + delay
+                                self.last_successful_request.response_timestamp = now
+                                self.last_successful_request.original_wait_time = original_wait_time
+
+                                tcp_info_c2m = TcpInfo.from_socket(self.socket)
+                                tcp_info_m2s = TcpInfo.from_socket(self.remote)
+                                if tcp_info_c2m is not None:
+                                    extra_message += f"c2m({int(tcp_info_c2m.tcpi_rtt / 1000)}ms) "
+                                if tcp_info_m2s is not None:
+                                    extra_message += f"m2s({int(tcp_info_m2s.tcpi_rtt / 1000)}ms) "
+                                if tcp_info_c2m is None or tcp_info_m2s is None:
+                                    extra_delay = EXTRA_DELAY
+                                else:
+                                    latency = (tcp_info_c2m.tcpi_rtt + tcp_info_m2s.tcpi_rtt) / 1000000.
+                                    delay = (self.last_successful_request.response_timestamp
+                                             - self.last_successful_request.request_timestamp)
+                                    extra_delay = max(0., delay - latency)
+                                    extra_delay = min(0.065, extra_delay)
+                                    extra_message += (f"latency={int(latency * 1000)}ms delay={int(delay * 1000)}ms "
+                                                      f"extraDelay={int(extra_delay * 1000)}ms")
+
+                                self.last_animation_lock_ends_at += original_wait_time + extra_delay
                                 wait_time = self.last_animation_lock_ends_at - now
 
                     if math.isclose(wait_time, original_wait_time):
                         self.log(f"S2C_ActionEffect: actionId={effect.action_id:04x} "
                                  f"sourceSequence={effect.source_sequence:04x} "
-                                 f"wait={int(original_wait_time * 1000)}ms{extra_message}")
+                                 f"wait={int(original_wait_time * 1000)}ms {extra_message}")
                     else:
                         self.log(f"S2C_ActionEffect: actionId={effect.action_id:04x} "
                                  f"sourceSequence={effect.source_sequence:04x} "
-                                 f"wait={int(original_wait_time * 1000)}ms->{int(wait_time * 1000)}ms{extra_message}")
+                                 f"wait={int(original_wait_time * 1000)}ms->{int(wait_time * 1000)}ms {extra_message}")
                         effect.animation_lock_duration = max(0., wait_time)
                         effect_bytes = bytes(effect)
                         ipc.data = effect_bytes + ipc.data[len(effect_bytes):]
@@ -716,7 +626,7 @@ class Connection:
                                                ))
                         ))
 
-                elif ipc.subtype == self.opcodes.S2C_ActorControlSelf:
+                elif ipc.subtype == self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF:
                     control = XivMessageIpcActorControlSelf(ipc.data, 0)
                     if control.category == XivMessageIpcActorControlSelf.CATEGORY_ROLLBACK:
                         action_id = control.param_3
@@ -737,7 +647,7 @@ class Connection:
                                  f"actionId={action_id:04x} "
                                  f"sourceSequence={source_sequence:08x}")
 
-                elif ipc.subtype == self.opcodes.S2C_ActorControl:
+                elif ipc.subtype == self.SUBTYPE_RESPONSE_ACTOR_CONTROL:
                     control = XivMessageIpcActorControl(ipc.data, 0)
                     if control.category == XivMessageIpcActorControl.CATEGORY_CANCEL_CAST:
                         action_id = control.param_3
@@ -751,7 +661,7 @@ class Connection:
 
                         self.log(f"S2C_ActorControl/CancelCast: actionId={action_id:04x}")
 
-                elif ipc.subtype == self.opcodes.S2C_ActorCast:
+                elif ipc.subtype == self.SUBTYPE_RESPONSE_ACTOR_CAST:
                     cast = XivMessageIpcActorCast(ipc.data, 0)
 
                     # Mark that the last request was a cast.
@@ -771,207 +681,47 @@ class Connection:
         return bundle
 
     def run(self):
-        self.upstream.settimeout(3)
-        log_path = f"/tmp/xmlm.{datetime.datetime.now():%Y%m%d%H%M%S}.{os.getpid()}.log"
+        self.remote.settimeout(3)
+        threads = []
+        log_path = f"/tmp/xmlm.{datetime.datetime.now():%Y%m%d%H%M%S}.{self.conn_id}.log"
         self.log("Log will be saved to", log_path)
-        with open(log_path, "w") as self.log_fp, self.downstream, self.upstream:
+        with open(log_path, "w") as self.log_fp:
             try:
-                self.upstream.connect((str(self.destination[0]), self.destination[1]))
-                self.upstream.settimeout(None)
+                try:
+                    self.remote.connect(self.destination)
+                except (ConnectionError, socket.timeout):
+                    return
+                self.remote.settimeout(60)
 
-                check_targets = {
-                    self.downstream: SocketSet(self.downstream, self.upstream, "D->U", self.to_upstream),
-                    self.upstream: SocketSet(self.upstream, self.downstream, "U->D", self.to_downstream),
-                }
-                while True:
-                    rlist = [
-                        k for k, v in check_targets.items() if v.incoming is not None
-                    ]
-                    wlist = [
-                        k for k, v in check_targets.items() if v.outgoing
-                    ]
-                    if not rlist and not wlist:
-                        break
-
-                    rlist, wlist, _ = select.select(rlist, wlist, [], 60)
-                    if not rlist and not wlist:  # timeout or empty
-                        break
-
-                    for target in check_targets.values():
-                        if target.source in rlist:
-                            try:
-                                data = target.source.recv(65536)
-                                if not data:
-                                    raise EOFError
-                            except (OSError, EOFError):
-                                self.log(target.log_prefix, "Read finish")
-                                target.incoming = None
-                                continue
-
-                            if self.opcodes is None:
-                                target.outgoing.extend(data)
-                            else:
-                                target.incoming.extend(data)
-                                it = XivBundle.find(target.incoming)
-                                while True:
-                                    try:
-                                        bundle = next(it)
-                                    except StopIteration as e:
-                                        del target.incoming[0:e.value]
-                                        break
-
-                                    if type(bundle) is bytes:
-                                        self.log(target.log_prefix, "discarded", " ".join(f"{x:02x}" for x in bundle))
-                                        target.outgoing.extend(bundle)
-                                    else:
-                                        bundle = target.process_function(bundle)
-                                        target.outgoing.extend(bytes(bundle))
-
-                    for target in check_targets.values():
-                        if target.outgoing is None:
-                            continue
-                        if target.outgoing:
-                            try:
-                                target.target.send(target.outgoing)
-                            except socket.error as e:
-                                if e.errno not in (socket.EWOULDBLOCK, socket.EAGAIN):
-                                    raise
-                                continue
-                            target.outgoing.clear()
-                        if target.incoming is None:
-                            target.outgoing = None
-                            self.log(target.log_prefix, "Source read and target write shutdown")
-                            try:
-                                target.source.shutdown(socket.SHUT_RD)
-                            except OSError:
-                                pass
-                            try:
-                                target.target.shutdown(socket.SHUT_WR)
-                            except OSError:
-                                pass
+                threads.append(threading.Thread(target=self.relay, args=(self.socket.recv,
+                                                                         self.remote.send,
+                                                                         self.source_to_destination,
+                                                                         "S2D")))
+                threads.append(threading.Thread(target=self.relay, args=(self.remote.recv,
+                                                                         self.socket.send,
+                                                                         self.destination_to_source,
+                                                                         "D2S")))
+                for x in threads:
+                    x.start()
+                self.broken_event.wait()
+            finally:
+                self.remote.close()
+                self.socket.close()
+                for x in threads:
+                    x.join()
                 self.log("Closed")
-            except Exception as e:
-                self.log("Closed, exception occurred:", type(e), e)
-                return -1
-            except KeyboardInterrupt:
-                # do no cleanup
-                # noinspection PyProtectedMember,PyUnresolvedReferences
-                os._exit(0)
-            return 0
+                Connection.all_connections.remove(self)
 
     def log(self, *msg):
-        text = " ".join(str(x) for x in ([datetime.datetime.now(), *msg]))
-        try:
-            print(self.screen_prefix, text)
-        except KeyboardInterrupt:
-            pass
-        finally:
+        with multithread_print_lock:
+            text = " ".join(str(x) for x in ([datetime.datetime.now(), *msg]))
+            print(f"[{self.conn_id}]", text)
             if self.log_fp:
                 self.log_fp.write(text + "\n")
                 self.log_fp.flush()
 
-    def resolve_adjusted_extra_delay(self, rtt: float) -> typing.Tuple[float, str]:
-        extra_message = ""
-        latency_downstream = TcpInfo.get_latency(self.downstream)
-        latency_upstream = TcpInfo.get_latency(self.upstream)
-        if latency_downstream is not None:
-            self.latency_downstream.add(latency_downstream)
-            extra_message += f" downstream={int(latency_downstream * 1000)}ms"
-        if latency_upstream is not None:
-            self.latency_upstream.add(latency_upstream)
-            extra_message += f" upstream={int(latency_upstream * 1000)}ms"
-        if latency_downstream is None or latency_upstream is None:
-            return DEFAULT_EXTRA_DELAY, extra_message
-
-        latency = latency_downstream + latency_upstream
-        if latency > rtt:
-            self.latency_exaggeration.add(latency - rtt)
-
-        if self.latency_exaggeration:
-            exaggeration = self.latency_exaggeration.median()
-            extra_message += f" latency={latency * 1000:.0f}ms->{1000 * (latency - exaggeration):.0f}ms"
-            latency -= exaggeration
-        else:
-            extra_message += f" latency={latency * 1000:.0f}ms"
-
-        if rtt > 100 and latency < 5:
-            extra_message += " unreliableLatency"
-            return DEFAULT_EXTRA_DELAY, extra_message
-
-        rtt_min = self.latency_application.min()
-        rtt_mean = self.latency_application.mean()
-        rtt_deviation = self.latency_application.deviation()
-        latency_mean = self.latency_upstream.mean() + self.latency_downstream.mean()
-        latency_deviation = self.latency_upstream.deviation() + self.latency_downstream.deviation()
-
-        # Correct latency and server response time values in case of outliers.
-        latency = clamp(latency, latency_mean - latency_deviation, latency_mean + latency_deviation)
-        rtt = clamp(rtt, rtt_mean - rtt_deviation, rtt_mean + rtt_deviation)
-
-        # Estimate latency based on server response time statistics.
-        latency_estimate = (rtt + rtt_min + rtt_mean) / 3 - rtt_deviation
-        extra_message += f" latencyEstimate={latency_estimate * 1000:.0f}ms"
-
-        # Correct latency value based on estimate if server response time is stable.
-        latency = max(latency_estimate, latency)
-
-        # This delay is based on server's processing time.
-        # If the server is busy, everyone should feel the same effect.
-        # * Only the player's ping is taken out of the equation. (- latencyAdjusted)
-        # * Prevent accidentally too high ExtraDelay. (Clamp above 1ms)
-        delay = clamp(rtt - latency, 0.001, MAXIMUM_EXTRA_DELAY)
-        extra_message += f" delayAdjusted={delay * 1000:.0f}ms"
-        return delay, extra_message
-
-
-def load_definitions():
-    global definitions
-    try:
-        with open("definitions.json", "r") as fp:
-            definitions = [OpcodeDefinition.from_dict(x) for x in json.load(fp)]
-    except Exception:
-        definitions_raw = []
-        print("Downloading opcode definition files...")
-        try:
-            rq = requests.get(OPCODE_DEFINITION_LIST_URL)
-            rq.raise_for_status()
-            filelist = json.loads(rq.content)
-
-            for f in filelist:
-                rq = requests.get(f["download_url"])
-                rq.raise_for_status()
-                data = json.loads(rq.content)
-                data["Name"] = f["name"]
-                definitions_raw.append(data)
-        except (requests.HTTPError, ConnectionError, json.JSONDecodeError) as e:
-            print(f"Failed to load opcode definition: {e}")
-            return -1
-        with open("definitions.json", "w") as fp:
-            json.dump(definitions_raw, fp)
-        definitions = [OpcodeDefinition.from_dict(x) for x in definitions_raw]
-
-
-def load_rules(port: int) -> typing.Set[str]:
-    rules = set()
-    for definition in definitions:
-        for iprange in definition.Server_IpRange:
-            rule = [
-                "-p tcp",
-                "-m multiport",
-                "--dports", ",".join(str(port1) if port1 == port2 else f"{port1}:{port2}"
-                                     for port1, port2 in definition.Server_PortRange)
-            ]
-            if isinstance(iprange, ipaddress.IPv4Network):
-                rule += ["-d", str(iprange)]
-            else:
-                rule += ["-m", "iprange", "--dst-range", f"{iprange[0]}-{iprange[1]}"]
-            rule.append(f"-j REDIRECT --to {port}")
-            rules.add(" ".join(rule))
-    return rules
-
 
 def __main__() -> int:
-    global definitions
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
     listener.setsockopt(socket.SOL_TCP, socket.TCP_QUICKACK, 1)
@@ -983,68 +733,34 @@ def __main__() -> int:
             continue
         break
 
-    load_definitions()
-
-    applied_rules = []
-    for rule in load_rules(port):
-        if os.system(f"iptables -t nat -I PREROUTING {rule}"):
-            for r in applied_rules:
-                os.system(f"iptables -t nat -D PREROUTING {r} > /dev/null")
-            print("This program requires root permissions.\n")
-            return -1
-        applied_rules.append(rule)
+    networks = ",".join(str(x) for x in INTL_DATACENTER_IP_NETWORK.union(KR_DATACENTER_IP_NETWORK))
+    if os.system(f"iptables -t nat -I PREROUTING -d {networks} -p tcp -j REDIRECT --to {port}"):
+        print("This program requires root permissions.\n")
+        return -1
     os.system("sysctl -w net.ipv4.ip_forward=1")
 
     listener.listen(8)
     print(f"Listening on {listener.getsockname()}...")
     print("Press Ctrl+C to quit.")
-
-    child_pids = set()
-
-    def on_child_exit(signum, frame):
-        if child_pids:
-            pid, status = os.waitpid(-1, os.WNOHANG)
-            if pid:
-                print(f"[{pid:<6}] has exit with status code {status}.")
-                child_pids.discard(pid)
-
-    signal.signal(signal.SIGCHLD, on_child_exit)
-
-    while True:
-        for child_pid in child_pids:
+    try:
+        while True:
             try:
-                os.kill(child_pid, 0)
-            except OSError:
-                child_pids.remove(child_pid)
-        try:
-            sock, source = listener.accept()
-        except KeyboardInterrupt:
-            break
-
-        child_pid = os.fork()
-        if child_pid == 0:
-            child_pids.clear()
-            listener.close()
-            return Connection(sock, source).run()
-        sock.close()
-        child_pids.add(child_pid)
-
-    for child_pid in child_pids:
-        try:
-            os.kill(child_pid, signal.SIGINT)
-        except OSError:
-            pass
-
-    err = False
-    for rule in applied_rules:
-        if os.system(f"iptables -t nat -D PREROUTING {rule}"):
-            print(f"Failed to remove iptables rule: {rule}")
-            err = True
-    if err:
-        return -1
-    else:
-        print("Cleanup complete.")
-        return 0
+                connection = Connection(*listener.accept())
+            except KeyboardInterrupt as e:
+                break
+            Connection.all_connections.append(connection)
+            threading.Thread(target=connection.run).start()
+        for x in list(Connection.all_connections):
+            x.broken_event.set()
+        for x in list(Connection.all_connections):
+            x.join()
+    finally:
+        if os.system(f"iptables -t nat -D PREROUTING -d {networks} -p tcp -j REDIRECT --to-port {port}"):
+            print("Failed to remove iptables rule.")
+            return -1
+        else:
+            print("Cleanup complete.")
+            return 0
 
 
 if __name__ == "__main__":
