@@ -435,12 +435,12 @@ class Connection:
 
         # See: https://github.com/ravahn/machina/tree/NetworkStructs/Machina.FFXIV/Headers/Opcodes
         if any(ipaddress.ip_address(self.destination[0]) in x for x in INTL_DATACENTER_IP_NETWORK):
-            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x02cc
-            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x0164
-            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x0356
-            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x008f, 0x0247, 0x02c1, 0x0295, 0x034c]
+            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x02a7
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x0264
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x0314
+            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x0102, 0x0345, 0x02b6, 0x0298, 0x03a4]
 
-            self.SUBTYPE_REQUEST_ACTION = [0x03a0, 0x036b]
+            self.SUBTYPE_REQUEST_ACTION = [0x0175, 0x021d]
 
             self.log(f"New[INTL]:", self.socket.getsockname(), self.socket.getpeername(), self.destination)
 
@@ -593,7 +593,7 @@ class Connection:
                                     delay = (self.last_successful_request.response_timestamp
                                              - self.last_successful_request.request_timestamp)
                                     extra_delay = max(0., delay - latency)
-                                    extra_delay = min(0.065, extra_delay)
+                                    extra_delay = min(0.06, extra_delay)
                                     extra_message += (f"latency={int(latency * 1000)}ms delay={int(delay * 1000)}ms "
                                                       f"extraDelay={int(extra_delay * 1000)}ms")
 
