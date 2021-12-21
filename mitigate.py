@@ -435,12 +435,12 @@ class Connection:
 
         # See: https://github.com/ravahn/machina/tree/NetworkStructs/Machina.FFXIV/Headers/Opcodes
         if any(ipaddress.ip_address(self.destination[0]) in x for x in INTL_DATACENTER_IP_NETWORK):
-            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x02a7
-            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x0264
-            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x0314
-            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x0102, 0x0345, 0x02b6, 0x0298, 0x03a4]
+            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x02f2
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x01fb
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x02c2
+            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x01d0, 0x02b0, 0x02be, 0x0288, 0x0238]
 
-            self.SUBTYPE_REQUEST_ACTION = [0x0175, 0x021d]
+            self.SUBTYPE_REQUEST_ACTION = [0x0188, 0x0188]
 
             self.log(f"New[INTL]:", self.socket.getsockname(), self.socket.getpeername(), self.destination)
 
