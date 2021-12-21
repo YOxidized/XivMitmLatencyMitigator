@@ -440,17 +440,17 @@ class Connection:
             self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x02c2
             self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x01d0, 0x02b0, 0x02be, 0x0288, 0x0238]
 
-            self.SUBTYPE_REQUEST_ACTION = [0x0188, 0x0188]
+            self.SUBTYPE_REQUEST_ACTION = [0x0188, 0x02d4]
 
             self.log(f"New[INTL]:", self.socket.getsockname(), self.socket.getpeername(), self.destination)
 
         elif any(ipaddress.ip_address(self.destination[0]) in x for x in KR_DATACENTER_IP_NETWORK):
-            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x012c
-            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x017a
-            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x007c
-            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x02d0, 0x0199, 0x02d1, 0x01a4, 0x016e]
+            self.SUBTYPE_RESPONSE_ACTOR_CAST = 0x02f2
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL = 0x01fb
+            self.SUBTYPE_RESPONSE_ACTOR_CONTROL_SELF = 0x02c2
+            self.SUBTYPE_RESPONSE_ACTION_RESULT = [0x01d0, 0x02b0, 0x02be, 0x0288, 0x0238]
 
-            self.SUBTYPE_REQUEST_ACTION = [0x02b3, 0x0250]
+            self.SUBTYPE_REQUEST_ACTION = [0x0188, 0x02d4]
 
             self.log(f"New[KR]:", self.socket.getsockname(), self.socket.getpeername(), self.destination)
         else:
